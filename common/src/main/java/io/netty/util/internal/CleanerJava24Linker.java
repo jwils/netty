@@ -22,9 +22,24 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Array;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 import static java.lang.invoke.MethodType.methodType;
 
+/**
+ * Allocates direct buffers through the Foreign Function and Memory API.
+ *
+ * <p>On a JVM, {@code io.netty.allocator.ffmLibrary} may specify an absolute path to a native library
+ * exporting a compatible {@code malloc}/{@code free} pair. This only customizes this cleaner; it does not
+ * change cleaner selection or enable native access. If this cleaner is available, an invalid explicit
+ * library fails initialization instead of silently using the default allocator.
+ *
+ * <p>The library is trusted native code and must support cross-thread deallocation. Symbol lookup can
+ * include dependencies, so finding both symbols does not verify compatible allocation ownership.
+ * The library remains loaded for the lifetime of the process. With no setting, or in a native image,
+ * the linker's default lookup is used. Native images do not support this setting.
+ */
 public class CleanerJava24Linker implements Cleaner {
     private static final InternalLogger logger;
 
@@ -34,7 +49,8 @@ public class CleanerJava24Linker implements Cleaner {
 
     static {
         boolean suitableJavaVersion;
-        if (System.getProperty("org.graalvm.nativeimage.imagecode") != null) {
+        boolean nativeImage = System.getProperty("org.graalvm.nativeimage.imagecode") != null;
+        if (nativeImage) {
             // native image supports this since 25, but we don't use PlatformDependent0 here, since
             // we need to initialize CleanerJava24Linker at build time.
             String v = System.getProperty("java.specification.version");
@@ -60,6 +76,7 @@ public class CleanerJava24Linker implements Cleaner {
         MethodHandle wrapMethod;
         MethodHandle freeMethod;
         Throwable error;
+        String allocatorLibrary = null;
 
         if (suitableJavaVersion) {
             try {
@@ -123,9 +140,29 @@ public class CleanerJava24Linker implements Cleaner {
                         lookup.findVirtual(linkerCls, "downcallHandle",
                                 methodType(MethodHandle.class, memSegCls, funcDescCls, linkerOptionArrayCls)),
                         nativeLinker);
-                MethodHandle findSymbol = MethodHandles.foldArguments(
-                        lookup.findVirtual(symbolLookupCls, "findOrThrow", methodType(memSegCls, String.class)),
-                        defaultLookupStatic);
+                // Read the setting only after the capability checks. Native images retain the default
+                // lookup: library handles from the image builder must not be captured in the image heap.
+                // Do not use SystemPropertyUtil here; it initializes logging at image build time.
+                if (!nativeImage) {
+                    allocatorLibrary = System.getProperty("io.netty.allocator.ffmLibrary");
+                }
+                Object allocatorLookup;
+                if (allocatorLibrary == null) {
+                    allocatorLookup = defaultLookupStatic.invoke();
+                } else {
+                    Path libraryPath = Paths.get(allocatorLibrary);
+                    if (!libraryPath.isAbsolute()) {
+                        throw new IllegalArgumentException("FFM allocator library must be an absolute path");
+                    }
+                    // Buffers may be freed on another thread long after this initialization.
+                    Class<?> arenaCls = Class.forName("java.lang.foreign.Arena");
+                    Object globalArena = lookup.findStatic(arenaCls, "global", methodType(arenaCls)).invoke();
+                    allocatorLookup = lookup.findStatic(symbolLookupCls, "libraryLookup",
+                            methodType(symbolLookupCls, Path.class, arenaCls)).invoke(libraryPath, globalArena);
+                }
+                // Use one lookup for both functions; do not add a per-symbol fallback.
+                MethodHandle findSymbol = lookup.findVirtual(symbolLookupCls, "findOrThrow",
+                        methodType(memSegCls, String.class)).bindTo(allocatorLookup);
 
                 // Constructing the malloc (long)long handle
                 Object longLayout = lookup.findStaticGetter(valueLayoutCls, "JAVA_LONG", ofLongValueLayoutCls).invoke();
@@ -165,6 +202,10 @@ public class CleanerJava24Linker implements Cleaner {
 
                 error = null;
             } catch (Throwable throwable) {
+                if (allocatorLibrary != null) {
+                    throw new ExceptionInInitializerError(new IllegalStateException(
+                            "Unable to initialize io.netty.allocator.ffmLibrary: " + allocatorLibrary, throwable));
+                }
                 mallocMethod = null;
                 wrapMethod = null;
                 freeMethod = null;
